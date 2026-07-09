@@ -79,25 +79,6 @@ async def deploy_pr_logic(pr_url: str):
         cloned_repo = git.Repo.clone_from(head_repo_url, clone_dir, branch=head_branch)
         yield f"Successfully cloned and checked out branch '{head_branch}'.\n"
 
-        # --- 3. Build Docker Image ---
-        image_tag = f"{repo_name.lower()}-pr-{pr_number}"
-        yield f"Building Docker image with tag: {image_tag}\n"
-
-        # Find the correct path to the Dockerfile dynamically (handling case sensitivity)
-        rel_dockerfile_path = None
-        possible_dockerfile_paths = [
-            "backend/Dockerfile",
-            "Backend/Dockerfile",
-            "Dockerfile"
-        ]
-        for p in possible_dockerfile_paths:
-            if os.path.exists(os.path.join(clone_dir, p)):
-                rel_dockerfile_path = p
-                break
-
-        # The build context is the root of the repository, so the Dockerfile can access both /frontend and /backend
-        build_context_path = clone_dir
-
         # Define base URLs for standard and Rancher Desktop socket paths
         socket_paths = [
             "unix:///var/run/docker.sock",
@@ -124,73 +105,141 @@ async def deploy_pr_logic(pr_url: str):
                 yield f"Error: Could not connect to Docker daemon. Please ensure Rancher Desktop or Docker Desktop is running. ({str(e)})\n"
                 return
 
-        if not rel_dockerfile_path:
-             yield "Error: Dockerfile not found in Backend/, backend/ or root of the repository.\n"
-             return
-
-        # Try to find the EXPOSE port in the Dockerfile dynamically
-        exposed_port = 8000  # Default fallback
-        try:
-            dockerfile_path = os.path.join(clone_dir, rel_dockerfile_path)
-            with open(dockerfile_path, "r", encoding="utf-8") as f:
-                content = f.read()
-                match = re.search(r"^\s*EXPOSE\s+(\d+)", content, re.MULTILINE | re.IGNORECASE)
-                if match:
-                    exposed_port = int(match.group(1))
-                    yield f"Detected exposed port in Dockerfile: {exposed_port}\n"
-        except Exception:
-            pass
-
-        # Stream build logs in real-time
-        try:
-            build_logs = docker_client.api.build(
-                path=build_context_path,
-                dockerfile=rel_dockerfile_path,
-                tag=image_tag,
-                rm=True,
-                decode=True
-            )
-            for chunk in build_logs:
-                if 'stream' in chunk:
-                    for line in chunk['stream'].splitlines():
-                        yield line + '\n'
-                elif 'errorDetail' in chunk:
-                    error_msg = chunk.get('error', 'Unknown build error')
-                    yield f"Build error: {error_msg}\n"
-                    return
-        except Exception as e:
-            yield f"Error initiating Docker build: {str(e)}\n"
-            return
-            
-        yield f"Successfully built image: {image_tag}\n"
-
-        # --- 4. Run Docker Container ---
-        container_name = f"{repo_name}-pr-{pr_number}-container"
+        # Find deployable components dynamically
+        components = []
         
-        try:
-            # Stop and remove container if it already exists
-            existing_container = docker_client.containers.get(container_name)
-            yield f"Stopping and removing existing container: {container_name}\n"
-            existing_container.stop()
-            existing_container.remove()
-        except docker.errors.NotFound:
-            pass # Container doesn't exist, which is fine
+        # Check backend
+        backend_rel = None
+        for p in ["backend/Dockerfile", "Backend/Dockerfile"]:
+            if os.path.exists(os.path.join(clone_dir, p)):
+                backend_rel = p
+                break
+        if backend_rel:
+            components.append({
+                "name": "backend",
+                "dockerfile": backend_rel,
+                "host_port": 5000,
+                "env": {"DB_HOST": "host.docker.internal"}
+            })
+            
+        # Check frontend
+        frontend_rel = None
+        for p in ["frontend/Dockerfile", "Frontend/Dockerfile"]:
+            if os.path.exists(os.path.join(clone_dir, p)):
+                frontend_rel = p
+                break
+        if frontend_rel:
+            components.append({
+                "name": "frontend",
+                "dockerfile": frontend_rel,
+                "host_port": 8080,
+                "env": {}
+            })
+            
+        # Fallback to root Dockerfile if no subfolders found
+        if not components:
+            if os.path.exists(os.path.join(clone_dir, "Dockerfile")):
+                components.append({
+                    "name": "app",
+                    "dockerfile": "Dockerfile",
+                    "host_port": 8080,
+                    "env": {"DB_HOST": "host.docker.internal"}
+                })
 
-        # Define environment variables for the container, ensuring host connection
-        container_env = {
-            "DB_HOST": "host.docker.internal"
-        }
+        if not components:
+            yield "Error: No Dockerfile found in the repository.\n"
+            return
 
-        yield f"Running Docker container '{container_name}'...\n"
-        container = docker_client.containers.run(
-            image_tag,
-            detach=True,
-            name=container_name,
-            ports={f'{exposed_port}/tcp': 8080}, # Maps detected exposed port to 8080 on host
-            environment=container_env
-        )
-        yield f"Container '{container.name}' started with ID: {container.short_id}\n"
-        yield "Access the application at http://localhost:8080 (port may vary).\n"
+        for comp in components:
+            comp_name = comp["name"]
+            rel_dockerfile_path = comp["dockerfile"]
+            host_port = comp["host_port"]
+            container_env = comp["env"]
+            
+            image_tag = f"{repo_name.lower()}-{comp_name}-pr-{pr_number}"
+            container_name = f"{repo_name}-{comp_name}-pr-{pr_number}-container"
+
+            yield f"\n--- Starting deployment for {comp_name} ---\n"
+            yield f"Building Docker image with tag: {image_tag}\n"
+
+            # Try to find the EXPOSE port in the Dockerfile dynamically
+            exposed_port = 8000  # Default fallback
+            try:
+                dockerfile_path = os.path.join(clone_dir, rel_dockerfile_path)
+                with open(dockerfile_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    match = re.search(r"^\s*EXPOSE\s+(\d+)", content, re.MULTILINE | re.IGNORECASE)
+                    if match:
+                        exposed_port = int(match.group(1))
+                        yield f"Detected exposed port in Dockerfile for {comp_name}: {exposed_port}\n"
+            except Exception:
+                pass
+
+            # Stream build logs in real-time
+            try:
+                build_context_path = clone_dir
+                build_logs = docker_client.api.build(
+                    path=build_context_path,
+                    dockerfile=rel_dockerfile_path,
+                    tag=image_tag,
+                    rm=True,
+                    decode=True
+                )
+                for chunk in build_logs:
+                    if 'stream' in chunk:
+                        for line in chunk['stream'].splitlines():
+                            yield line + '\n'
+                    elif 'errorDetail' in chunk:
+                        error_msg = chunk.get('error', 'Unknown build error')
+                        yield f"Build error: {error_msg}\n"
+                        return
+            except Exception as e:
+                yield f"Error initiating Docker build for {comp_name}: {str(e)}\n"
+                return
+                
+            yield f"Successfully built image: {image_tag}\n"
+
+            try:
+                # Stop and remove container if it already exists
+                existing_container = docker_client.containers.get(container_name)
+                yield f"Stopping and removing existing container: {container_name}\n"
+                existing_container.stop()
+                existing_container.remove()
+            except docker.errors.NotFound:
+                pass # Container doesn't exist, which is fine
+
+            extra_hosts = None
+            if comp_name == "frontend":
+                try:
+                    backend_container_name = f"{repo_name}-backend-pr-{pr_number}-container"
+                    backend_container = docker_client.containers.get(backend_container_name)
+                    backend_ip = backend_container.attrs['NetworkSettings']['Networks']['bridge']['IPAddress']
+                    if backend_ip:
+                        extra_hosts = {"backend": backend_ip}
+                        yield f"Found running backend container at IP: {backend_ip}. Mapping host 'backend' to this IP.\n"
+                except Exception as e:
+                    # Fallback to bridge gateway IP
+                    try:
+                        network = docker_client.networks.get("bridge")
+                        configs = network.attrs.get("IPAM", {}).get("Config", [])
+                        gateway_ip = configs[0].get("Gateway") if configs else "172.17.0.1"
+                    except Exception:
+                        gateway_ip = "172.17.0.1"
+                    extra_hosts = {"backend": gateway_ip}
+                    yield f"Warning: Could not resolve backend container IP ({e}). Falling back to bridge gateway: {gateway_ip}\n"
+
+            yield f"Running Docker container '{container_name}'...\n"
+            container = docker_client.containers.run(
+                image_tag,
+                detach=True,
+                name=container_name,
+                ports={f'{exposed_port}/tcp': host_port}, # Maps detected exposed port to component's host_port
+                environment=container_env,
+                extra_hosts=extra_hosts
+            )
+            yield f"Container '{container.name}' started with ID: {container.short_id}\n"
+            yield f"Access the {comp_name} at http://localhost:{host_port}\n"
+
         yield "\n--- DEPLOYMENT COMPLETE ---\n"
 
     except Exception as e:
