@@ -11,6 +11,7 @@ import uvicorn
 import docker
 from github import Github
 import git
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
@@ -157,7 +158,7 @@ async def deploy_pr_logic(pr_url: str):
             container_env = comp["env"]
             
             image_tag = f"{repo_name.lower()}-{comp_name}-pr-{pr_number}"
-            container_name = f"{repo_name}-{comp_name}-pr-{pr_number}-container"
+            container_name = f"{repo_name}-{comp_name}-container"
 
             yield f"\n--- Starting deployment for {comp_name} ---\n"
             yield f"Building Docker image with tag: {image_tag}\n"
@@ -211,7 +212,7 @@ async def deploy_pr_logic(pr_url: str):
             extra_hosts = None
             if comp_name == "frontend":
                 try:
-                    backend_container_name = f"{repo_name}-backend-pr-{pr_number}-container"
+                    backend_container_name = f"{repo_name}-backend-container"
                     backend_container = docker_client.containers.get(backend_container_name)
                     backend_ip = backend_container.attrs['NetworkSettings']['Networks']['bridge']['IPAddress']
                     if backend_ip:
