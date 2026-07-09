@@ -141,17 +141,28 @@ async def deploy_pr_logic(pr_url: str):
         except Exception:
             pass
 
-        image, build_logs = docker_client.images.build(
-            path=build_context_path,
-            dockerfile=rel_dockerfile_path, # Specify the exact case-sensitive Dockerfile location
-            tag=image_tag,
-            rm=True
-        )
-        for chunk in build_logs:
-            if 'stream' in chunk:
-                for line in chunk['stream'].splitlines():
-                    yield line + '\n'
-        yield f"Successfully built image: {image.short_id}\n"
+        # Stream build logs in real-time
+        try:
+            build_logs = docker_client.api.build(
+                path=build_context_path,
+                dockerfile=rel_dockerfile_path,
+                tag=image_tag,
+                rm=True,
+                decode=True
+            )
+            for chunk in build_logs:
+                if 'stream' in chunk:
+                    for line in chunk['stream'].splitlines():
+                        yield line + '\n'
+                elif 'errorDetail' in chunk:
+                    error_msg = chunk.get('error', 'Unknown build error')
+                    yield f"Build error: {error_msg}\n"
+                    return
+        except Exception as e:
+            yield f"Error initiating Docker build: {str(e)}\n"
+            return
+            
+        yield f"Successfully built image: {image_tag}\n"
 
         # --- 4. Run Docker Container ---
         container_name = f"{repo_name}-pr-{pr_number}-container"
@@ -165,12 +176,18 @@ async def deploy_pr_logic(pr_url: str):
         except docker.errors.NotFound:
             pass # Container doesn't exist, which is fine
 
+        # Define environment variables for the container, ensuring host connection
+        container_env = {
+            "DB_HOST": "host.docker.internal"
+        }
+
         yield f"Running Docker container '{container_name}'...\n"
         container = docker_client.containers.run(
             image_tag,
             detach=True,
             name=container_name,
-            ports={f'{exposed_port}/tcp': 8080} # Maps detected exposed port to 8080 on host
+            ports={f'{exposed_port}/tcp': 8080}, # Maps detected exposed port to 8080 on host
+            environment=container_env
         )
         yield f"Container '{container.name}' started with ID: {container.short_id}\n"
         yield "Access the application at http://localhost:8080 (port may vary).\n"
