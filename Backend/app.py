@@ -86,8 +86,8 @@ async def deploy_pr_logic(pr_url: str):
         # Find the correct path to the Dockerfile dynamically (handling case sensitivity)
         rel_dockerfile_path = None
         possible_dockerfile_paths = [
-            "Backend/Dockerfile",
             "backend/Dockerfile",
+            "Backend/Dockerfile",
             "Dockerfile"
         ]
         for p in possible_dockerfile_paths:
